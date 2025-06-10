@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recipe Saver & Shopping List</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #f0f2f5; font-family: 'Inter', sans-serif; }
+        .card { background-color: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 16px; margin-bottom: 16px; }
+        .button { background-color: #42b883; color: white; border-radius: 6px; padding: 8px 16px; font-weight: bold; cursor: pointer; border: none; transition: background-color 0.2s; }
+        .button:hover:not(:disabled) { background-color: #34a06f; }
+        .button:disabled { background-color: #a0d4bb; cursor: not-allowed; }
+        .button-secondary { background-color: #e4e6eb; color: #050505; }
+        .button-secondary:hover:not(:disabled) { background-color: #d8dade; }
+        .button-danger { background-color: #fa383e; }
+        .button-danger:hover { background-color: #e02c32; }
+        .input { border: 1px solid #dddfe2; border-radius: 6px; padding: 8px 12px; width: 100%; margin-bottom: 12px; }
+        .api-key-bar { background-color: #fffbe6; border: 1px solid #facc15; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+        .instructions { white-space: pre-wrap; background-color: #f9f9f9; padding: 10px; border-radius: 6px; margin-top: 10px; }
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background: white;
+            padding: 24px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            max-width: 90%;
+            width: 400px;
+            position: relative;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .modal-close-button {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            cursor: pointer;
+            color: #666;
+        }
+        .recipe-image-thumb {
+            width: 80px;
+            height: 80px;
+            object-fit: cover;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .recipe-image-thumb:hover {
+            transform: scale(1.05);
+        }
+        .image-full-modal img {
+            max-width: 90vw;
+            max-height: 90vh;
+            object-fit: contain;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script type="text/javascript">
+        // --- Crypto Helper Functions for Export/Import Password Protection ---
+        // Converts a string to Uint8Array
+        const strToUint8 = (str) => new TextEncoder().encode(str);
+        // Converts Uint8Array to a Base64 string
+        const uint8ToBase64 = (arr) => btoa(String.fromCharCode(...arr));
+        // Converts Base64 string to Uint8Array
+        const base64ToUint8 = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+
+        // Derives an AES key from a password and salt using PBKDF2
+        const deriveKey = async (password, salt) => {
+            const passwordBytes = strToUint8(password);
+            const saltBytes = strToUint8(salt); // Salt is now string, convert to Uint8Array
+
+            const keyMaterial = await crypto.subtle.importKey(
+                'raw',
+                passwordBytes,
+                { name: 'PBKDF2' },
+                false,
+                ['deriveKey']
+            );
+
+            return crypto.subtle.deriveKey(
+                {
+                    name: 'PBKDF2',
+                    salt: saltBytes,
+                    iterations: 100000, // Good number of iterations
+                    hash: 'SHA-256',
+                },
+                keyMaterial,
+                { name: 'AES-GCM', length: 256 },
+                true,
+                ['encrypt', 'decrypt']
+            );
+        };
+
+        // Encrypts data using AES-GCM
+        const encryptData = async (plaintext, password, salt) => {
+            const dataBytes = strToUint8(plaintext);
+            const iv = crypto.getRandomValues(new Uint8Array(12)); // 12 bytes is standard for AES-GCM
+
+            const key = await deriveKey(password, salt);
+
+            const ciphertextBuffer = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv: iv },
+                key,
+                dataBytes
+            );
+
+            return {
+                iv: uint8ToBase64(iv),
+                ciphertext: uint8ToBase64(new Uint8Array(ciphertextBuffer)),
+            };
+        };
+
+        // Decrypts data using AES-GCM
+        const decryptData = async (ivB64, ciphertextB64, password, salt) => {
+            const iv = base64ToUint8(ivB64);
+            const ciphertext = base64ToUint8(ciphertextB64);
+
+            const key = await deriveKey(password, salt);
+
+            const plaintextBuffer = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: iv },
+                key,
+                ciphertext
+            );
+
+            return new TextDecoder().decode(plaintextBuffer);
+        };
+
+        // --- REAL AI Function (Spoonacular API) ---
+        const parseIngredientsWithSpoonacular = async (text, apiKey) => {
+            if (!apiKey) throw new Error("Spoonacular API Key is missing.");
+            if (!text) return [];
+
+            const params = new URLSearchParams();
+            params.append('ingredientList', text);
+            
+            const response = await fetch(`https://api.spoonacular.com/recipes/parseIngredients?apiKey=${apiKey}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: params,
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.message || `API request failed with status ${response.status}`);
+            }
+
+            const data = await response.json();
+            return data.map(item => ({
+                id: item.id || Date.now() + Math.random(), // Use a unique ID for Vue's key prop
+                quantity: item.amount,
+                unit: item.unit,
+                name: item.originalName || item.name,
+            }));
+        };
+
+        // --- Reusable Modal Component ---
+        const Modal = {
+            props: ['show', 'title'],
+            emits: ['close'],
+            template: `
+                <div v-if="show" class="modal-overlay" @click.self="$emit('close')">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3 class="text-xl font-bold">{{ title }}</h3>
+                            <button @click="$emit('close')" class="modal-close-button">&times;</button>
+                        </div>
+                        <slot></slot>
+                        <div v-if="$slots.footer" class="modal-footer mt-4 pt-4 border-t border-gray-200">
+                            <slot name="footer"></slot>
+                        </div>
+                    </div>
+                </div>
+            `
+        };
+
+        // --- Confirmation Modal Component ---
+        const ConfirmationModal = {
+            components: { Modal },
+            props: ['show', 'message'],
+            emits: ['confirm', 'cancel'],
+            template: `
+                <Modal :show="show" title="Confirm Action" @close="$emit('cancel')">
+                    <p class="text-gray-700">{{ message }}</p>
+                    <template #footer>
+                        <div class="flex justify-end gap-2">
+                            <button @click="$emit('cancel')" class="button button-secondary">Cancel</button>
+                            <button @click="$emit('confirm')" class="button button-danger">Confirm</button>
+                        </div>
+                    </template>
+                </Modal>
+            `
+        };
+
+        // --- Input Modal Component ---
+        const InputModal = {
+            components: { Modal },
+            props: ['show', 'title', 'message', 'inputType', 'defaultValue'],
+            emits: ['confirm', 'cancel'],
+            setup(props, { emit }) {
+                const inputValue = Vue.ref(props.defaultValue || ''); 
+
+                Vue.watch(() => props.defaultValue, (newVal) => { 
+                    inputValue.value = newVal;
+                });
+
+                const handleConfirm = () => {
+                    emit('confirm', inputValue.value);
+                    inputValue.value = ''; // Reset after confirm
+                };
+
+                const handleCancel = () => {
+                    emit('cancel');
+                    inputValue.value = ''; // Reset after cancel
+                };
+
+                return { inputValue, handleConfirm, handleCancel };
+            },
+            template: `
+                <Modal :show="show" :title="title" @close="handleCancel">
+                    <p class="text-gray-700 mb-4">{{ message }}</p>
+                    <input :type="inputType || 'text'" v-model="inputValue" class="input mb-4" />
+                    <template #footer>
+                        <div class="flex justify-end gap-2">
+                            <button @click="handleCancel" class="button button-secondary">Cancel</button>
+                            <button @click="handleConfirm" class="button">OK</button>
+                        </div>
+                    </template>
+                </Modal>
+            `
+        };
+
+        // --- Image Display Modal ---
+        const ImageModal = {
+            components: { Modal },
+            props: ['show', 'imageUrl', 'title'],
+            emits: ['close'],
+            template: `
+                <Modal :show="show" :title="title" @close="$emit('close')">
+                    <div class="flex justify-center items-center">
+                        <img :src="imageUrl" alt="Recipe Image" class="image-full-modal" />
+                    </div>
+                </Modal>
+            `
+        };
+
+        const AddRecipeForm = {
+            props: ['apiKey'],
+            emits: ['save-recipe', 'show-message'],
+            setup(props, { emit }) {
+                const form = Vue.reactive({ 
+                    url: '',
+                    name: '',
+                    rawText: '',
+                    instructions: '',
+                    imageUrl: '' // New property for image Base64
+                });
+                const ingredients = Vue.ref([]); 
+                const isParsing = Vue.ref(false); 
+                const parseError = Vue.ref(''); 
+
+                const handleImageFileChange = (event) => {
+                    const file = event.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            form.imageUrl = e.target.result; // Store as base64
+                            emit('show-message', 'Image loaded successfully!', 'info');
+                        };
+                        reader.onerror = () => {
+                            emit('show-message', 'Failed to read image file.', 'error');
+                            form.imageUrl = '';
+                        };
+                        reader.readAsDataURL(file);
+                    } else {
+                        form.imageUrl = '';
+                    }
+                };
+
+                const handleParse = async () => {
+                    parseError.value = '';
+                    isParsing.value = true;
+                    try {
+                        const parsed = await parseIngredientsWithSpoonacular(form.rawText, props.apiKey);
+                        ingredients.value = parsed;
+                        if (parsed.length === 0 && form.rawText) {
+                            emit('show-message', 'No ingredients could be parsed from the text. Please check the format or manually add them.', 'info');
+                        } else if (parsed.length > 0) {
+                             emit('show-message', 'Ingredients parsed successfully!', 'success');
+                        }
+                    } catch (err) {
+                        parseError.value = err.message;
+                        emit('show-message', `Error parsing ingredients: ${err.message}`, 'error');
+                    } finally {
+                        isParsing.value = false;
+                    }
+                };
+                
+                const resetForm = () => {
+                    form.url = '';
+                    form.name = '';
+                    form.rawText = '';
+                    form.instructions = '';
+                    form.imageUrl = ''; // Clear image as well
+                    ingredients.value = [];
+                    parseError.value = '';
+                    if (document.getElementById('recipeImageInput')) {
+                        document.getElementById('recipeImageInput').value = ''; // Clear file input
+                    }
+                };
+
+                const handleSave = () => {
+                    if (!form.name.trim()) {
+                        emit('show-message', 'Please provide a recipe name.', 'error');
+                        return;
+                    }
+                    if (ingredients.value.length === 0) {
+                        emit('show-message', 'Please add at least one ingredient.', 'error');
+                        return;
+                    }
+
+                    const newRecipe = { 
+                        id: Date.now(), // Assign a local unique ID
+                        url: form.url,
+                        name: form.name,
+                        instructions: form.instructions,
+                        imageUrl: form.imageUrl, // Include the image
+                        ingredients: ingredients.value.map(ing => ({
+                            quantity: parseFloat(ing.quantity) || 0,
+                            unit: ing.unit,
+                            name: ing.name
+                        }))
+                    };
+
+                    emit('save-recipe', newRecipe);
+                    emit('show-message', 'Recipe saved successfully!', 'success');
+                    resetForm();
+                };
+
+                return { form, ingredients, isParsing, parseError, handleParse, handleSave, handleImageFileChange };
+            },
+            template: `
+                <div class="card">
+                    <h2 class="text-xl font-bold mb-4">Add New Recipe</h2>
+                    <input type="text" v-model="form.name" placeholder="Recipe Name" class="input" />
+                    <input type="text" v-model="form.url" placeholder="Video URL (TikTok, YouTube, etc.)" class="input" />
+                    
+                    <h3 class="font-semibold mt-4 mb-2">Recipe Image (Optional)</h3>
+                    <input type="file" id="recipeImageInput" @change="handleImageFileChange" accept="image/*" class="input" />
+                    <div v-if="form.imageUrl" class="mt-2 text-sm text-gray-600">Image selected. It will be stored with the recipe.</div>
+
+                    <h3 class="font-semibold mt-4 mb-2">Paste Ingredients Text</h3>
+                    <textarea v-model="form.rawText" class="input" rows="5" placeholder="Paste ingredients from video description here..."></textarea>
+                    <button @click="handleParse" class="button button-secondary w-full mb-4" :disabled="isParsing || !apiKey || !form.rawText">
+                        {{ isParsing ? 'Parsing...' : 'Parse with Real AI ✨' }}
+                    </button>
+
+                    <div v-if="parseError" class="text-red-500 text-sm mb-4">{{ parseError }}</div>
+                    
+                    <h3 class="font-semibold mt-4 mb-2">Review & Edit Ingredients</h3>
+                    <div v-for="ing in ingredients" :key="ing.id" class="grid grid-cols-12 gap-2 mb-2 items-center">
+                        <input type="number" v-model="ing.quantity" placeholder="Qty" class="input col-span-2" />
+                        <input type="text" v-model="ing.unit" placeholder="Unit" class="input col-span-3" />
+                        <input type="text" v-model="ing.name" placeholder="Name" class="input col-span-7" />
+                    </div>
+
+                    <h3 class="font-semibold mt-4 mb-2">Cooking Instructions</h3>
+                    <textarea v-model="form.instructions" class="input" rows="7" placeholder="Paste cooking steps here..."></textarea>
+
+                    <button @click="handleSave" class="button w-full mt-4">Save Recipe</button>
+                </div>
+            `
+        };
+
+        const RecipeCard = {
+            props: ['recipe'],
+            emits: ['delete-recipe', 'select-recipe', 'show-message', 'open-image-modal'],
+            components: { InputModal },
+            setup(props, { emit }) {
+                const showPortionsModal = Vue.ref(false); 
+                const portionsInput = Vue.ref("1"); 
+
+                const handleSelect = () => {
+                    portionsInput.value = "1"; // Reset to default
+                    showPortionsModal.value = true;
+                };
+
+                const confirmPortions = (portions) => {
+                    showPortionsModal.value = false;
+                    const parsedPortions = parseFloat(portions);
+                    if (!isNaN(parsedPortions) && parsedPortions > 0) {
+                        emit('select-recipe', props.recipe.id, parsedPortions);
+                    } else {
+                        emit('show-message', 'Please enter a valid number for portions.', 'error');
+                    }
+                };
+
+                const cancelPortions = () => {
+                    showPortionsModal.value = false;
+                };
+
+                const openImage = () => {
+                    if (props.recipe.imageUrl) {
+                        emit('open-image-modal', props.recipe.imageUrl, props.recipe.name);
+                    }
+                };
+
+                return { handleSelect, showPortionsModal, portionsInput, confirmPortions, cancelPortions, openImage };
+            },
+            template: `
+                <div class="card">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h3 class="font-bold text-lg">{{ recipe.name }}</h3>
+                            <a v-if="recipe.url" :href="recipe.url" target="_blank" rel="noopener noreferrer" class="text-sm text-blue-500 hover:underline">Original Content</a>
+                        </div>
+                        <button @click="$emit('delete-recipe', recipe.id)" class="button button-danger px-2 py-1 text-xs">Delete</button>
+                    </div>
+                    
+                    <div v-if="recipe.imageUrl" class="mt-3">
+                        <img :src="recipe.imageUrl" alt="Recipe Image" class="recipe-image-thumb" @click="openImage" />
+                    </div>
+
+                    <h4 class="font-semibold mt-3">Ingredients:</h4>
+                    <ul class="list-disc list-inside mt-2 text-gray-700">
+                        <li v-for="(ing, i) in recipe.ingredients" :key="i">{{ Number(ing.quantity.toFixed(2)) }} {{ ing.unit || '' }} {{ ing.name }}</li>
+                    </ul>
+                    
+                    <div v-if="recipe.instructions">
+                        <h4 class="font-semibold mt-3">Instructions:</h4>
+                        <div class="instructions text-gray-800">{{ recipe.instructions }}</div>
+                    </div>
+
+                    <button @click="handleSelect" class="button w-full mt-4">Add to Shopping List</button>
+
+                    <InputModal
+                        :show="showPortionsModal"
+                        title="Add to Shopping List"
+                        :message="'How many portions of &quot;' + recipe.name + '&quot; do you want to make?'"
+                        inputType="number"
+                        :defaultValue="portionsInput"
+                        @confirm="confirmPortions"
+                        @cancel="cancelPortions"
+                    />
+                </div>
+            `
+        };
+
+        const ShoppingList = {
+            props: ['items'],
+            emits: ['clear-list'],
+            setup(props) {
+                const aggregatedList = Vue.computed(() => { 
+                    const map = new Map();
+                    props.items.forEach(item => {
+                        const key = `${item.name.toLowerCase()}|${item.unit?.toLowerCase() || 'item'}`;
+                        if (map.has(key)) {
+                            map.get(key).quantity += item.quantity;
+                        } else {
+                            map.set(key, { ...item });
+                        }
+                    });
+                    return Array.from(map.values()).sort((a,b) => a.name.localeCompare(b.name));
+                });
+                return { aggregatedList };
+            },
+            template: `
+                <div class="card sticky top-4">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-xl font-bold">Shopping List</h2>
+                        <button v-if="items.length" @click="$emit('clear-list')" class="button button-secondary">Clear All</button>
+                    </div>
+                    <div v-if="!items.length" class="text-center text-gray-500">Your shopping list is empty.</div>
+                    <ul v-else>
+                        <li v-for="(item, index) in aggregatedList" :key="index" class="flex items-center mb-2 p-2 rounded-md hover:bg-gray-100">
+                            <input type="checkbox" class="mr-3 h-5 w-5 flex-shrink-0"/>
+                            <span class="flex-1">{{ Number(item.quantity.toFixed(2)) }} {{ item.unit || '' }} {{ item.name }}</span>
+                        </li>
+                    </ul>
+                </div>
+            `
+        };
+
+        const app = Vue.createApp({ 
+            components: { AddRecipeForm, RecipeCard, ShoppingList, ConfirmationModal, Modal, InputModal, ImageModal },
+            setup() {
+                const apiKey = Vue.ref(''); 
+                const recipes = Vue.ref([]); 
+                const shoppingListItems = Vue.ref([]); 
+
+                // Modals state
+                const showDeleteConfirm = Vue.ref(false); 
+                const recipeToDeleteId = Vue.ref(null); 
+                const showAppMessage = Vue.ref(false); 
+                const appMessageType = Vue.ref('info'); 
+                const appMessageText = Vue.ref(''); 
+                let messageTimeout = null;
+
+                // Image Modal state
+                const showImageModal = Vue.ref(false);
+                const currentImageModalUrl = Vue.ref('');
+                const currentImageModalTitle = Vue.ref('');
+
+                // Ref for the hidden file input
+                const importFileInput = Vue.ref(null);
+                const exportPasswordInput = Vue.ref('');
+                const importPasswordInput = Vue.ref('');
+
+
+                // Load recipes from localStorage on mount
+                Vue.onMounted(() => { 
+                    recipes.value = JSON.parse(localStorage.getItem('recipes_local') || '[]');
+                    apiKey.value = localStorage.getItem('spoonacularApiKey_vue') || '';
+                });
+
+                // Watch for changes in recipes and save to localStorage
+                Vue.watch(recipes, (newVal) => {
+                    localStorage.setItem('recipes_local', JSON.stringify(newVal));
+                }, { deep: true });
+
+                // Watch for changes in apiKey and save to localStorage
+                Vue.watch(apiKey, (newVal) => { 
+                    localStorage.setItem('spoonacularApiKey_vue', newVal);
+                });
+
+                const handleShowAppMessage = (message, type = 'info') => {
+                    if (messageTimeout) clearTimeout(messageTimeout);
+                    appMessageText.value = message;
+                    appMessageType.value = type;
+                    showAppMessage.value = true;
+                    messageTimeout = setTimeout(() => {
+                        showAppMessage.value = false;
+                        appMessageText.value = '';
+                    }, 3000);
+                };
+
+                const handleSaveRecipe = (newRecipe) => {
+                    recipes.value.push(newRecipe);
+                };
+
+                const handleDeleteRecipeAttempt = (id) => {
+                    recipeToDeleteId.value = id;
+                    showDeleteConfirm.value = true;
+                };
+
+                const confirmDeleteRecipe = () => {
+                    recipes.value = recipes.value.filter(r => r.id !== recipeToDeleteId.value);
+                    showDeleteConfirm.value = false;
+                    recipeToDeleteId.value = null;
+                    handleShowAppMessage('Recipe deleted successfully!', 'success');
+                };
+
+                const cancelDeleteRecipe = () => {
+                    showDeleteConfirm.value = false;
+                    recipeToDeleteId.value = null;
+                };
+
+                const handleSelectRecipe = (recipeId, portions) => {
+                    const recipe = recipes.value.find(r => r.id === recipeId);
+                    if (recipe) {
+                        const itemsToAdd = recipe.ingredients.map(ing => ({
+                            ...ing,
+                            quantity: (ing.quantity || 0) * portions
+                        }));
+                        shoppingListItems.value.push(...itemsToAdd);
+                        handleShowAppMessage(`${recipe.name} (${portions} portions) added to shopping list!`, 'success');
+                    }
+                };
+                const handleClearShoppingList = () => shoppingListItems.value = [];
+
+                const openImageModal = (url, title) => {
+                    currentImageModalUrl.value = url;
+                    currentImageModalTitle.value = title;
+                    showImageModal.value = true;
+                };
+
+                const closeImageModal = () => {
+                    showImageModal.value = false;
+                    currentImageModalUrl.value = '';
+                    currentImageModalTitle.value = '';
+                };
+
+                // --- Export/Import Functions ---
+                const showExportPasswordModal = Vue.ref(false);
+                const showImportPasswordModal = Vue.ref(false);
+
+                const promptExportPassword = () => {
+                    if (recipes.value.length === 0) {
+                        handleShowAppMessage('No recipes to export.', 'info');
+                        return;
+                    }
+                    exportPasswordInput.value = ''; // Clear previous input
+                    showExportPasswordModal.value = true;
+                };
+
+                const confirmExportPassword = async (password) => {
+                    showExportPasswordModal.value = false;
+                    if (!password) {
+                        handleShowAppMessage('Export cancelled: Password is required.', 'error');
+                        return;
+                    }
+                    try {
+                        const exportData = {
+                            recipes: recipes.value,
+                            apiKey: apiKey.value, // Include API key
+                            version: 1 // Add a version for future compatibility
+                        };
+                        const plaintext = JSON.stringify(exportData);
+                        const salt = uint8ToBase64(crypto.getRandomValues(new Uint8Array(16))); // Generate new salt for each export
+
+                        const encrypted = await encryptData(plaintext, password, salt);
+                        
+                        const fileContent = JSON.stringify({
+                            iv: encrypted.iv,
+                            salt: salt,
+                            ciphertext: encrypted.ciphertext,
+                            encryptedApiKey: true // Flag to indicate API key is included and encrypted
+                        });
+
+                        const blob = new Blob([fileContent], { type: "application/json" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `recipes_encrypted_export_${new Date().toISOString().slice(0,10)}.json`;
+                        document.body.appendChild(a); 
+                        a.click();
+                        document.body.removeChild(a); 
+                        URL.revokeObjectURL(url);
+                        handleShowAppMessage('Recipes exported and encrypted successfully!', 'success');
+                    } catch (e) {
+                        console.error("Error exporting recipes:", e);
+                        handleShowAppMessage(`Failed to export recipes: ${e.message}. Check console for details.`, 'error');
+                    }
+                };
+
+                const cancelExportPassword = () => {
+                    showExportPasswordModal.value = false;
+                    handleShowAppMessage('Export cancelled.', 'info');
+                };
+
+                const triggerImport = () => {
+                    importFileInput.value.click(); 
+                };
+
+                const handleImportFile = async (event) => {
+                    const file = event.target.files[0];
+                    if (!file) {
+                        handleShowAppMessage('No file selected.', 'info');
+                        return;
+                    }
+                    // Store file temporarily for password prompt
+                    importFileInput.value.currentFile = file; 
+                    importPasswordInput.value = ''; // Clear previous input
+                    showImportPasswordModal.value = true;
+                };
+
+                const confirmImportPassword = async (password) => {
+                    showImportPasswordModal.value = false;
+                    const file = importFileInput.value.currentFile;
+
+                    if (!file || !password) {
+                        handleShowAppMessage('Import cancelled: File or password missing.', 'error');
+                        return;
+                    }
+
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        try {
+                            const rawData = e.target.result;
+                            let importedData;
+
+                            try {
+                                const parsedFile = JSON.parse(rawData);
+                                // Check if it's an encrypted file
+                                if (parsedFile.iv && parsedFile.salt && parsedFile.ciphertext) {
+                                    const decryptedText = await decryptData(parsedFile.iv, parsedFile.ciphertext, password, parsedFile.salt);
+                                    importedData = JSON.parse(decryptedText);
+                                } else {
+                                    // Assume it's a plain JSON array if not encrypted
+                                    importedData = parsedFile;
+                                }
+                            } catch (decryptionError) {
+                                console.error("Decryption/Parsing failed:", decryptionError);
+                                handleShowAppMessage('Failed to decrypt or parse file. Incorrect password or corrupted file.', 'error');
+                                return; // Stop here if decryption/parsing fails
+                            }
+                            
+                            if (!Array.isArray(importedData.recipes)) { // Expecting importedData.recipes if it was an encrypted export
+                                // For plain JSON, it might just be the array itself
+                                if (!Array.isArray(importedData)) {
+                                    throw new Error("Invalid file format. Expected a JSON array of recipes or encrypted recipe data.");
+                                }
+                                importedData = { recipes: importedData, apiKey: null }; // Treat as plain recipes, no API key
+                            }
+
+                            // Update API key if present and encrypted
+                            if (importedData.apiKey) {
+                                apiKey.value = importedData.apiKey;
+                                localStorage.setItem('spoonacularApiKey_vue', importedData.apiKey);
+                                handleShowAppMessage('Spoonacular API Key imported!', 'info');
+                            }
+
+                            // Generate new IDs for imported recipes to avoid conflicts with existing local ones
+                            const newRecipes = importedData.recipes.map(recipe => ({
+                                ...recipe,
+                                id: Date.now() + Math.random() // Assign a new unique ID
+                            }));
+
+                            recipes.value = newRecipes; // Overwrite current recipes with imported ones
+                            handleShowAppMessage(`Successfully imported ${newRecipes.length} recipes!`, 'success');
+                        } catch (e) {
+                            console.error("Error importing recipes:", e);
+                            handleShowAppMessage(`Failed to import recipes: ${e.message}`, 'error');
+                        } finally {
+                            // Clear the file input value to allow selecting the same file again if needed
+                            event.target.value = ''; 
+                            importFileInput.value.currentFile = null; // Clear temp file
+                        }
+                    };
+                    reader.onerror = () => {
+                        handleShowAppMessage('Error reading file.', 'error');
+                    };
+                    reader.readAsText(file);
+                };
+
+                const cancelImportPassword = () => {
+                    showImportPasswordModal.value = false;
+                    importFileInput.value.currentFile = null; // Clear temp file
+                    handleShowAppMessage('Import cancelled.', 'info');
+                };
+
+
+                return { 
+                    apiKey, 
+                    recipes, 
+                    shoppingListItems, 
+                    handleSaveRecipe, 
+                    handleDeleteRecipeAttempt, 
+                    handleSelectRecipe, 
+                    handleClearShoppingList,
+                    showDeleteConfirm,
+                    confirmDeleteRecipe,
+                    cancelDeleteRecipe,
+                    showAppMessage,
+                    appMessageType,
+                    appMessageText,
+                    handleShowAppMessage,
+                    openImageModal,
+                    closeImageModal,
+                    showImageModal,
+                    currentImageModalUrl,
+                    currentImageModalTitle,
+                    // Export/Import
+                    exportRecipes: promptExportPassword, // Call prompt function
+                    triggerImport,
+                    importRecipes: handleImportFile, // Call handler that prompts for password
+                    importFileInput,
+                    showExportPasswordModal,
+                    confirmExportPassword,
+                    cancelExportPassword,
+                    showImportPasswordModal,
+                    confirmImportPassword,
+                    cancelImportPassword,
+                    exportPasswordInput,
+                    importPasswordInput
+                };
+            },
+            template: `
+                <div class="container mx-auto p-4">
+                    <h1 class="text-3xl font-bold text-center mb-6">Recipe Saver & Shopping List</h1>
+                    
+                    <div class="api-key-bar">
+                        <label for="apiKey" class="block font-bold mb-2 text-yellow-800">Spoonacular API Key</label>
+                        <input id="apiKey" type="password" v-model="apiKey" placeholder="Paste your free Spoonacular API key here" class="input" />
+                        <p class="text-xs text-yellow-700 mt-1">
+                            You need to create a **console user** to get a free API key from the <a href="https://spoonacular.com/food-api/console#Dashboard" target="_blank" rel="noopener noreferrer" class="underline">Spoonacular API Console Dashboard</a>.
+                        </p>
+                    </div>
+
+                    <!-- App-level message display -->
+                    <div v-if="showAppMessage" :class="{
+                        'p-3 rounded-md text-white mb-4 transition-opacity duration-300': true,
+                        'bg-green-500': appMessageType === 'success',
+                        'bg-red-500': appMessageType === 'error',
+                        'bg-blue-500': appMessageType === 'info'
+                    }">
+                        {{ appMessageText }}
+                    </div>
+
+                    <div class="grid md:grid-cols-2 gap-8">
+                        <div>
+                            <add-recipe-form :api-key="apiKey" @save-recipe="handleSaveRecipe" @show-message="handleShowAppMessage" />
+                            
+                            <h2 class="text-2xl font-bold mt-8 mb-4">My Saved Recipes</h2>
+                            
+                            <!-- Export/Import Buttons -->
+                            <div class="flex gap-4 mb-4">
+                                <button @click="exportRecipes" class="button button-secondary flex-1">Export Recipes (JSON)</button>
+                                <button @click="triggerImport" class="button flex-1">Import Recipes (JSON)</button>
+                                <input type="file" ref="importFileInput" @change="importRecipes" accept="application/json" class="hidden" />
+                            </div>
+
+                            <p v-if="!recipes.length" class="text-gray-500">No recipes saved yet. Add one above!</p>
+                            <recipe-card v-for="recipe in recipes" :key="recipe.id" :recipe="recipe" 
+                                @delete-recipe="handleDeleteRecipeAttempt" 
+                                @select-recipe="handleSelectRecipe"
+                                @show-message="handleShowAppMessage"
+                                @open-image-modal="openImageModal" />
+                        </div>
+                        <div>
+                            <shopping-list :items="shoppingListItems" @clear-list="handleClearShoppingList" />
+                        </div>
+                    </div>
+
+                    <!-- Confirmation Modal for Delete -->
+                    <ConfirmationModal
+                        :show="showDeleteConfirm"
+                        message="Are you sure you want to delete this recipe? This action cannot be undone."
+                        @confirm="confirmDeleteRecipe"
+                        @cancel="cancelDeleteRecipe"
+                    />
+
+                    <!-- Password Input Modals for Export/Import -->
+                    <InputModal
+                        :show="showExportPasswordModal"
+                        title="Set Export Password"
+                        message="Enter a password to encrypt your recipe file. Remember this password to import the file later."
+                        inputType="password"
+                        :defaultValue="exportPasswordInput"
+                        @confirm="confirmExportPassword"
+                        @cancel="cancelExportPassword"
+                    />
+
+                    <InputModal
+                        :show="showImportPasswordModal"
+                        title="Enter Import Password"
+                        message="Enter the password used to encrypt this recipe file."
+                        inputType="password"
+                        :defaultValue="importPasswordInput"
+                        @confirm="confirmImportPassword"
+                        @cancel="cancelImportPassword"
+                    />
+
+                    <!-- Full Image Modal -->
+                    <ImageModal
+                        :show="showImageModal"
+                        :imageUrl="currentImageModalUrl"
+                        :title="currentImageModalTitle"
+                        @close="closeImageModal"
+                    />
+                </div>
+            `
+        });
+
+        app.mount('#app');
+    </script>
+</body>
+</html>
